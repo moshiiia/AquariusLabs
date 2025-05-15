@@ -1,0 +1,13 @@
+version: '3.8'
+services:
+  jenkins:
+    image: jenkins/jenkins:lts
+    user: root
+    ports:
+      - "8080:8080"    # Веб-интерфейс Jenkins
+      - "50000:50000"  # Для агентов Jenkins
+      - "2443:2443"    # HTTPS для OpenBMC
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock  # Доступ к Docker
+      - ./jenkins-data:/var/jenkins_home           # Данные Jenkins
+    restart: always

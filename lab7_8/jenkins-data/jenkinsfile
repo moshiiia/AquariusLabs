@@ -1,0 +1,135 @@
+pipeline {
+    agent any
+
+    environment {
+        QEMU_IMAGE_DIR = '/var/jenkins_home/romulus'
+        QEMU_LOG = 'qemu.log'
+        VENV = 'venv'
+    }
+
+    stages {
+        stage('Prepare Environment') {
+            steps {
+                sh '''
+                    apt-get update
+                    apt-get install -y wget python3-venv python3-pip qemu-system-arm curl xvfb chromium-driver chromium
+
+                    echo "Checking Jenkins server availability..."
+                    PRIMARY_URL="https://jenkins.openbmc.org/job/latest-master/label=docker-builder,target=romulus/lastSuccessfulBuild/"
+                    FALLBACK_URL="https://openpower.xyz/job/openbmc-build/distro=ubuntu,label=builder,target=romulus/lastSuccessfulBuild/"
+
+                    curl -s -I "$PRIMARY_URL" | grep -q "200 OK" || {
+                        echo "Primary Jenkins server unavailable, trying fallback..."
+                        curl -s -I "$FALLBACK_URL" | grep -q "200 OK" || { echo "Fallback server also unavailable"; exit 1; }
+                        PRIMARY_URL="$FALLBACK_URL"
+                    }
+
+                    echo "Downloading the latest Romulus image..."
+                    # Download the artifact directory listing
+                    curl -s "$PRIMARY_URL/artifact/openbmc/build/tmp/deploy/images/romulus/" > artifacts.html
+
+                    # Extract the latest obmc-phosphor-image-romulus*.static.mtd filename
+                    IMAGE_FILE=$(grep -o 'obmc-phosphor-image-romulus[^"]*\\.static\\.mtd' artifacts.html | head -n 1)
+                    if [ -z "$IMAGE_FILE" ]; then
+                        echo "No Romulus image found in artifact directory"
+                        exit 1
+                    fi
+
+                    # Download the image
+                    wget "$PRIMARY_URL/artifact/openbmc/build/tmp/deploy/images/romulus/$IMAGE_FILE" -P ${QEMU_IMAGE_DIR} || { echo "Failed to download $IMAGE_FILE"; exit 1; }
+
+                    ls -lh ${QEMU_IMAGE_DIR}  # Debug: List directory contents
+
+                    # Create and activate virtual environment
+                    python3 -m venv ${VENV}
+                    . ${VENV}/bin/activate
+                    pip install --upgrade pip
+                    pip install pytest selenium locust
+                '''
+            }
+        }
+
+        stage('Start QEMU with OpenBMC') {
+            steps {
+                script {
+                    // Find the latest .static.mtd file in the directory
+                    def qemuImage = sh(
+                        script: "ls -t ${QEMU_IMAGE_DIR}/*.static.mtd 2>/dev/null | head -n 1 || true",
+                        returnStdout: true
+                    ).trim()
+                    
+                    if (qemuImage.isEmpty()) {
+                        error("No QEMU image found in ${QEMU_IMAGE_DIR}. Directory contents: \$(ls -lh ${QEMU_IMAGE_DIR})")
+                    }
+                    
+                    echo "Using QEMU image: ${qemuImage}"
+                    
+
+
+                    sh """
+                        nohup qemu-system-arm -m 256 -M romulus-bmc -nographic \
+                            -drive file=${qemuImage},format=raw,if=mtd \
+                            -net nic -net user,hostfwd=:0.0.0.0:2222-:22,hostfwd=:0.0.0.0:2443-:443,hostfwd=udp:0.0.0.0:2623-:623 \
+                            > ${QEMU_LOG} 2>&1 &
+
+                    sleep 120
+                    """
+                }
+            }
+        }
+
+        stage('Run Redfish API Tests') {
+            steps {
+                sh '''
+                    . ${VENV}/bin/activate
+                    pytest -v /var/jenkins_home/test_redfish.py > redfish_report.log || true
+                '''
+                archiveArtifacts artifacts: 'redfish_report.log', onlyIfSuccessful: false
+            }
+        }
+
+        stage('Run WebUI Tests') {
+            steps {
+                sh '''
+                    export DISPLAY=:99
+                    Xvfb :99 &
+                    sleep 1
+                    if ! pgrep Xvfb; then
+                        echo "Xvfb failed to start"
+                        exit 1
+                    fi
+
+                    . ${VENV}/bin/activate
+                    pytest -v /var/jenkins_home/lab4.py > webui_report.log || true
+                '''
+                archiveArtifacts artifacts: 'webui_report.log', onlyIfSuccessful: false
+            }
+        }
+
+        stage('Run Load Tests') {
+            steps {
+                sh '''
+                    . ${VENV}/bin/activate
+                    locust -f /var/jenkins_home/redfish_locustfile.py --headless --host https://localhost:2443 \
+                        --users 5 --spawn-rate 1 -t1m > load_report.log 2>&1 || true
+                '''
+                archiveArtifacts artifacts: 'load_report.log', onlyIfSuccessful: false
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: "${QEMU_LOG}", onlyIfSuccessful: false
+            sh '''
+                pkill -f qemu-system-arm || true
+                sleep 2
+                if pgrep -f qemu-system-arm; then
+                    echo "QEMU process still running, forcing termination"
+                    pkill -9 -f qemu-system-arm || true
+                fi
+                rm -rf ${QEMU_IMAGE_DIR} /var/jenkins_home/artifacts.html
+            '''
+        }
+    }
+}
